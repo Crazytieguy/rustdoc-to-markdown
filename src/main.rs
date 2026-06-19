@@ -64,6 +64,16 @@ struct Cli {
         conflicts_with = "json"
     )]
     no_deps: bool,
+
+    #[arg(
+        long,
+        value_name = "TRIPLE",
+        help = "Document for a target triple other than the host (e.g. x86_64-unknown-linux-gnu).\n\
+                Lets you document platform-specific crates that don't build on the host.\n\
+                Requires the target's standard library (rustup target add <triple>).",
+        conflicts_with = "json"
+    )]
+    target: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -130,7 +140,7 @@ fn main() -> Result<()> {
     }
 
     // Get cargo metadata once for all operations
-    let metadata = get_cargo_metadata()?;
+    let metadata = get_cargo_metadata(cli.target.as_deref())?;
 
     // Workspace mode
     if cli.workspace {
@@ -166,29 +176,43 @@ struct Dependency {
     version: String,
 }
 
-fn get_cargo_metadata() -> Result<serde_json::Value> {
-    // Get current host platform for filtering platform-specific dependencies
-    let host_triple = std::env::var("CARGO_BUILD_TARGET").or_else(|_| {
-        let output = Command::new("rustc")
-            .args(["-vV"])
-            .output()
-            .context("Failed to run rustc")?;
+/// Directory where rustdoc writes its JSON output. With an explicit `--target`,
+/// cargo nests build artifacts under `target/<triple>/doc` instead of
+/// `target/doc`, so the generated JSON must be looked up there.
+fn doc_dir(target_dir: &Path, target: Option<&str>) -> PathBuf {
+    match target {
+        Some(triple) => target_dir.join(triple).join("doc"),
+        None => target_dir.join("doc"),
+    }
+}
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout
-            .lines()
-            .find(|line| line.starts_with("host:"))
-            .and_then(|line| line.split_whitespace().nth(1))
-            .map(String::from)
-            .context("Failed to parse host triple from rustc")
-    })?;
+fn get_cargo_metadata(target: Option<&str>) -> Result<serde_json::Value> {
+    // Filter platform-specific dependencies for the platform we're documenting:
+    // the requested target if given, otherwise the host.
+    let filter_triple = match target {
+        Some(triple) => triple.to_string(),
+        None => std::env::var("CARGO_BUILD_TARGET").or_else(|_| {
+            let output = Command::new("rustc")
+                .args(["-vV"])
+                .output()
+                .context("Failed to run rustc")?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout
+                .lines()
+                .find(|line| line.starts_with("host:"))
+                .and_then(|line| line.split_whitespace().nth(1))
+                .map(String::from)
+                .context("Failed to parse host triple from rustc")
+        })?,
+    };
 
     let output = Command::new("cargo")
         .args([
             "metadata",
             "--format-version=1",
             "--filter-platform",
-            &host_triple,
+            &filter_triple,
         ])
         .output()
         .context("Failed to run 'cargo metadata'")?;
@@ -281,6 +305,7 @@ fn document_specific_packages(metadata: &serde_json::Value, cli: &Cli) -> Result
             &target_dir,
             metadata,
             cli.include_private,
+            cli.target.as_deref(),
         ) {
             Ok(true) => {
                 // Successfully documented
@@ -345,6 +370,7 @@ fn document_specific_packages(metadata: &serde_json::Value, cli: &Cli) -> Result
             &target_dir,
             metadata,
             cli.include_private,
+            cli.target.as_deref(),
         );
 
         print_documentation_summary(&successful_deps, &failed_deps);
@@ -385,16 +411,16 @@ fn get_lib_target_name(package: &serde_json::Value) -> Option<String> {
 fn document_current_crate(metadata: &serde_json::Value, cli: &Cli) -> Result<Option<String>> {
     println!("🔨 Generating rustdoc JSON for current crate...");
 
-    // Run cargo rustdoc to generate JSON
-    let mut args = vec![
-        "+nightly",
-        "rustdoc",
-        "--lib",
-        "--",
-        "--output-format=json",
-        "-Z",
-        "unstable-options",
-    ];
+    // Run cargo rustdoc to generate JSON. `--target` (when set) is a cargo-level
+    // flag and must come before the `--` that separates the rustdoc flags.
+    let mut args = vec!["+nightly", "rustdoc", "--lib"];
+
+    if let Some(target) = cli.target.as_deref() {
+        args.push("--target");
+        args.push(target);
+    }
+
+    args.extend(["--", "--output-format=json", "-Z", "unstable-options"]);
 
     if cli.include_private {
         args.push("--document-private-items");
@@ -447,10 +473,9 @@ fn document_current_crate(metadata: &serde_json::Value, cli: &Cli) -> Result<Opt
         get_lib_target_name(root_package).unwrap_or_else(|| crate_name.replace("-", "_"));
 
     // Find the generated JSON file
-    let target_dir = metadata["target_directory"].as_str().unwrap_or("target");
-    let json_path = PathBuf::from(target_dir)
-        .join("doc")
-        .join(format!("{}.json", lib_target_name));
+    let target_dir = PathBuf::from(metadata["target_directory"].as_str().unwrap_or("target"));
+    let json_path =
+        doc_dir(&target_dir, cli.target.as_deref()).join(format!("{}.json", lib_target_name));
 
     if !json_path.exists() {
         bail!("Generated JSON file not found at {}", json_path.display());
@@ -494,12 +519,20 @@ fn try_document_dependencies(
     target_dir: &Path,
     metadata: &serde_json::Value,
     include_private: bool,
+    target: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
     let mut successful = Vec::new();
     let mut failed = Vec::new();
 
     for dep in deps_to_document {
-        match document_single_dependency(dep, output_dir, target_dir, metadata, include_private) {
+        match document_single_dependency(
+            dep,
+            output_dir,
+            target_dir,
+            metadata,
+            include_private,
+            target,
+        ) {
             Ok(true) => {
                 // Successfully documented
                 successful.push(dep.name.clone());
@@ -549,6 +582,7 @@ fn document_all_dependencies(metadata: &serde_json::Value, cli: &Cli) -> Result<
         &target_dir,
         metadata,
         cli.include_private,
+        cli.target.as_deref(),
     );
 
     print_documentation_summary(&successful, &failed);
@@ -600,6 +634,7 @@ fn document_workspace(metadata: &serde_json::Value, cli: &Cli) -> Result<()> {
             &target_dir,
             metadata,
             cli.include_private,
+            cli.target.as_deref(),
         ) {
             Ok(true) => {
                 // Successfully documented
@@ -671,6 +706,7 @@ fn document_workspace(metadata: &serde_json::Value, cli: &Cli) -> Result<()> {
             &target_dir,
             metadata,
             cli.include_private,
+            cli.target.as_deref(),
         );
 
         print_documentation_summary(&successful_deps, &failed_deps);
@@ -917,6 +953,7 @@ fn document_single_dependency(
     target_dir: &Path,
     metadata: &serde_json::Value,
     include_private: bool,
+    target: Option<&str>,
 ) -> Result<bool> {
     // Build the package specification
     // If we have a version, use name@version to disambiguate multiple versions
@@ -926,18 +963,17 @@ fn document_single_dependency(
         format!("{}@{}", dep.name, dep.version)
     };
 
-    // Generate rustdoc JSON for the dependency
-    let mut args = vec![
-        "+nightly",
-        "rustdoc",
-        "-p",
-        &package_spec,
-        "--lib",
-        "--",
-        "--output-format=json",
-        "-Z",
-        "unstable-options",
-    ];
+    // Generate rustdoc JSON for the dependency. `--target` (when set) is a
+    // cargo-level flag and must come before the `--` that separates the
+    // rustdoc flags.
+    let mut args = vec!["+nightly", "rustdoc", "-p", &package_spec, "--lib"];
+
+    if let Some(target) = target {
+        args.push("--target");
+        args.push(target);
+    }
+
+    args.extend(["--", "--output-format=json", "-Z", "unstable-options"]);
 
     if include_private {
         args.push("--document-private-items");
@@ -996,9 +1032,7 @@ fn document_single_dependency(
         .unwrap_or_else(|| dep.name.replace("-", "_"));
 
     // Find the generated JSON file
-    let json_path = target_dir
-        .join("doc")
-        .join(format!("{}.json", lib_target_name));
+    let json_path = doc_dir(target_dir, target).join(format!("{}.json", lib_target_name));
 
     if !json_path.exists() {
         bail!("Generated JSON file not found at {}", json_path.display());

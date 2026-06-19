@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **`--target` flag**: Document a crate for a target triple other than the host, so you can document platform-specific crates that don't build on your machine. For example, on macOS `cargo doc-md -p tokio-tun --target x86_64-unknown-linux-gnu` documents `tokio-tun`, which only builds on Linux and otherwise fails. Requires the target's standard library (`rustup target add <triple>`).
+
 ## [0.11.0] - 2025-11-10
 
 ### Added

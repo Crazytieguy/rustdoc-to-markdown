@@ -15,6 +15,21 @@ fn run_cargo_doc_md(args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// The host target triple, parsed from `rustc -vV` (e.g. `x86_64-unknown-linux-gnu`).
+fn host_triple() -> String {
+    let output = Command::new("rustc")
+        .args(["-vV"])
+        .output()
+        .expect("Failed to run rustc");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find(|line| line.starts_with("host:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .map(String::from)
+        .expect("Failed to parse host triple from rustc -vV")
+}
+
 #[test]
 fn test_flag_validation_json_with_package() {
     let result = run_cargo_doc_md(&["--json", "test.json", "-p", "tokio"]);
@@ -233,4 +248,35 @@ fn test_output_directory_validation_parent_missing() {
     );
 
     fs::remove_dir_all(temp_dir.join("cargo_doc_md_test_parent_12345")).ok();
+}
+
+#[test]
+fn test_target_flag_host_triple() {
+    // Pass the host triple to --target so the test runs anywhere without a
+    // cross-compilation target installed. With --target set, rustdoc writes its
+    // JSON under `target/<triple>/doc` rather than `target/doc`; documenting the
+    // host triple confirms cargo-doc-md looks in the right place.
+    let output_dir = PathBuf::from("target/doc-md-test-target");
+    fs::remove_dir_all(&output_dir).ok();
+
+    let host = host_triple();
+    let result = run_cargo_doc_md(&[
+        "--target",
+        &host,
+        "--no-deps",
+        "-o",
+        output_dir.to_str().unwrap(),
+    ]);
+
+    assert!(
+        result.is_ok(),
+        "Documenting for the host target should succeed: {:?}",
+        result
+    );
+    assert!(
+        output_dir.join("cargo_doc_md").exists(),
+        "Crate documentation should be generated under the output directory"
+    );
+
+    fs::remove_dir_all(&output_dir).ok();
 }
