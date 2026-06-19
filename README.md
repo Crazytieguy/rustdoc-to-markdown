@@ -26,6 +26,9 @@ cargo doc-md --workspace
 
 # Custom output directory
 cargo doc-md -o docs/
+
+# Document a crate for another target (e.g. a Linux-only crate from macOS)
+cargo doc-md -p tokio-tun --target x86_64-unknown-linux-gnu
 ```
 
 Run `cargo doc-md --help` for all options.
